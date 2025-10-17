@@ -1,0 +1,110 @@
+from scapy.all import sniff, TCP, IP
+from flask import Flask, render_template, request, Response, jsonify
+import threading
+import queue
+import sys
+import time
+from datetime import datetime
+
+app = Flask(__name__)
+
+# Global variables for sniffing control and results
+sniffing = False
+result_queue = queue.Queue()
+sniff_thread = None
+
+def is_valid_ip(ip):
+    """Validate if the input is a proper IPv4 address."""
+    try:
+        parts = ip.split('.')
+        if len(parts) != 4:
+            return False
+        for part in parts:
+            if not 0 <= int(part) <= 255:
+                return False
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+def packet_callback(packet):
+    """Analyze packets for HTTP GET requests and store results."""
+    if packet.haslayer(TCP) and packet.haslayer(IP):
+        ip_src = packet[IP].src
+        ip_dst = packet[IP].dst
+        port = packet[TCP].dport
+        if port == 80 and packet.haslayer('Raw'):
+            payload = packet['Raw'].load.decode('utf-8', errors='ignore')
+            if 'GET' in payload.split('\n')[0]:
+                request_line = payload.split('\n')[0].strip()
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                is_suspicious = any(keyword in payload.lower() for keyword in ['/admin', '/login', '/api', '/shell'])
+                result_queue.put({
+                    'timestamp': timestamp,
+                    'src_ip': ip_src,
+                    'dst_ip': ip_dst,
+                    'request': request_line,
+                    'suspicious': 'Yes' if is_suspicious else 'No'
+                })
+
+def sniff_http_get(target_ip=None):
+    """Sniff packets for HTTP GET requests, optionally filtering by IP."""
+    global sniffing
+    bpf_filter = "tcp port 80"
+    if target_ip and is_valid_ip(target_ip):
+        bpf_filter += f" and host {target_ip}"
+    try:
+        sniff(filter=bpf_filter, prn=packet_callback, store=0, stop_filter=lambda x: not sniffing)
+    except Exception as e:
+        result_queue.put({'error': f"Sniffing error: {str(e)}"})
+
+@app.route('/')
+def index():
+    """Render the main UI page."""
+    return render_template('index.html')
+
+@app.route('/start_sniffing', methods=['POST'])
+def start_sniffing():
+    """Start the sniffer with the provided IP."""
+    global sniffing, sniff_thread
+    if sniffing:
+        return jsonify({'status': 'error', 'message': 'Sniffer already running'})
+    
+    target_ip = request.form.get('target_ip', '').strip()
+    if target_ip and not is_valid_ip(target_ip):
+        return jsonify({'status': 'error', 'message': 'Invalid IPv4 address'})
+    
+    sniffing = True
+    sniff_thread = threading.Thread(target=sniff_http_get, args=(target_ip,))
+    sniff_thread.daemon = True
+    sniff_thread.start()
+    return jsonify({'status': 'success', 'message': f'Sniffer started for {"all traffic" if not target_ip else target_ip}'})
+
+@app.route('/stop_sniffing', methods=['POST'])
+def stop_sniffing():
+    """Stop the sniffer."""
+    global sniffing, sniff_thread
+    if not sniffing:
+        return jsonify({'status': 'error', 'message': 'Sniffer not running'})
+    
+    sniffing = False
+    if sniff_thread:
+        sniff_thread.join()
+    return jsonify({'status': 'success', 'message': 'Sniffer stopped'})
+
+@app.route('/get_results')
+def get_results():
+    """Stream sniffer results to the client."""
+    def stream():
+        while True:
+            try:
+                result = result_queue.get_nowait()
+                yield f"data: {jsonify(result).get_data(as_text=True)}\n\n"
+            except queue.Empty:
+                time.sleep(0.1)
+                if not sniffing:
+                    yield f"data: {jsonify({'status': 'stopped'}).get_data(as_text=True)}\n\n"
+                    break
+    return Response(stream(), mimetype='text/event-stream')
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000, debug=False)
